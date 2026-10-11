@@ -18,6 +18,8 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
+#include "uidcore.h"  // hex parsing, BCC, UID formatting, line/command parsing
+
 #ifndef RC522_SS_PIN
 #define RC522_SS_PIN 10
 #endif
@@ -35,16 +37,13 @@ bool haveUid = false;
 enum Mode { MODE_IDLE, MODE_READ, MODE_WRITE, MODE_DIAG };
 Mode mode = MODE_READ;
 
-// Line buffer for serial commands (filled until Enter, then parsed)
-char lineBuf[40];
-byte lineLen = 0;
+// Collects serial bytes until Enter; the finished line is then parsed.
+LineReader lineReader;
 
 void printUid(const byte *buf, byte size) {
-  for (byte i = 0; i < size; i++) {
-    if (buf[i] < 0x10) Serial.print('0');
-    Serial.print(buf[i], HEX);
-    if (i + 1 < size) Serial.print(' ');
-  }
+  char text[3 * sizeof(savedUid)];  // "XX " per byte, last space becomes NUL
+  formatUid(buf, size, text, sizeof(text));
+  Serial.print(text);
 }
 
 void printMenu() {
@@ -69,29 +68,13 @@ void printMenu() {
 void setUidFromText(const char *s) {
   byte tmp[8];
   byte n = 0;
-  int hi = -1;  // pending high nibble, -1 = none
-  for (const char *p = s; *p; p++) {
-    char c = *p;
-    int v;
-    if (c >= '0' && c <= '9') v = c - '0';
-    else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
-    else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
-    else continue;  // skip spaces, colons, dashes, etc.
+  HexParseStatus st = parseHexBytes(s, tmp, sizeof(tmp), &n);
 
-    if (hi < 0) {
-      hi = v;
-    } else {
-      if (n < (byte)sizeof(tmp)) tmp[n] = (byte)((hi << 4) | v);
-      n++;
-      hi = -1;
-    }
-  }
-
-  if (hi >= 0) {
+  if (st == HEX_ODD_DIGITS) {
     Serial.println(F("!! Odd number of hex digits. Use whole bytes."));
     return;
   }
-  if (n == 0) {
+  if (st == HEX_EMPTY) {
     Serial.println(F("!! Usage: U 79 D6 83 63  (4 hex bytes)"));
     return;
   }
@@ -111,43 +94,39 @@ void setUidFromText(const char *s) {
 }
 
 // Dispatch one complete command line.
-void processLine(char *line) {
-  char *p = line;
-  while (*p == ' ' || *p == '\t') p++;  // skip leading whitespace
-  char cmd = *p;
-  const char *args = (*p) ? p + 1 : p;
-
-  if (cmd == 'r' || cmd == 'R') {
-    mode = MODE_READ;
-    Serial.println(F(">> Read mode. Tap the old fob."));
-  } else if (cmd == 'u' || cmd == 'U') {
-    mode = MODE_IDLE;  // stop card polling while we set the UID by hand
-    setUidFromText(args);
-  } else if (cmd == 'w' || cmd == 'W') {
-    if (!haveUid) {
-      Serial.println(F("!! No UID yet. Use R (read) or U (enter by hand) first."));
-      return;
-    }
-    mode = MODE_WRITE;
-    Serial.println(F(">> Write mode. Tap a blank magic card."));
-  } else if (cmd == 'd' || cmd == 'D') {
-    mode = MODE_DIAG;
-    Serial.println(F(">> Diagnostics mode. Tap the card to test."));
+void processLine(const char *line) {
+  const char *args;
+  switch (parseCommand(line, &args)) {
+    case CMD_READ:
+      mode = MODE_READ;
+      Serial.println(F(">> Read mode. Tap the old fob."));
+      break;
+    case CMD_SET_UID:
+      mode = MODE_IDLE;  // stop card polling while we set the UID by hand
+      setUidFromText(args);
+      break;
+    case CMD_WRITE:
+      if (!haveUid) {
+        Serial.println(F("!! No UID yet. Use R (read) or U (enter by hand) first."));
+        return;
+      }
+      mode = MODE_WRITE;
+      Serial.println(F(">> Write mode. Tap a blank magic card."));
+      break;
+    case CMD_DIAG:
+      mode = MODE_DIAG;
+      Serial.println(F(">> Diagnostics mode. Tap the card to test."));
+      break;
+    case CMD_NONE:
+    case CMD_UNKNOWN:
+      break;  // silently ignored, same as before
   }
 }
 
 // Collect serial bytes into a line; run the command on Enter.
 void handleSerial() {
   while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (lineLen == 0) continue;  // skip empty lines and stray CR/LF
-      lineBuf[lineLen] = '\0';
-      processLine(lineBuf);
-      lineLen = 0;
-    } else if (lineLen < sizeof(lineBuf) - 1) {
-      lineBuf[lineLen++] = c;
-    }
+    if (lineReader.feed((char)Serial.read())) processLine(lineReader.line());
   }
 }
 
@@ -205,8 +184,7 @@ bool writeUidGen2() {
   }
 
   // Patch the UID and recompute the BCC check byte.
-  for (byte i = 0; i < 4; i++) buf[i] = savedUid[i];
-  buf[4] = buf[0] ^ buf[1] ^ buf[2] ^ buf[3];
+  patchBlock0Uid(buf, savedUid);
 
   status = mfrc522.MIFARE_Write(0, buf, 16);
   if (status != MFRC522::STATUS_OK) {

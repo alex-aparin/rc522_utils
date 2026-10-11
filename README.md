@@ -1,5 +1,7 @@
 # rc522_utils
 
+[![CI](https://github.com/alex-aparin/rc522_utils/actions/workflows/ci.yml/badge.svg)](https://github.com/alex-aparin/rc522_utils/actions/workflows/ci.yml)
+
 An Arduino Uno + RC522 utility for restoring **your own** broken fob: read the
 UID from the old chip and write it onto a blank magic card.
 
@@ -28,6 +30,25 @@ pio run              # build
 pio run -t upload    # flash the Uno
 pio device monitor   # open the serial monitor (115200)
 ```
+
+## Tests
+
+The hardware-independent logic (hex parsing for `U`, BCC calculation, UID
+formatting, serial line and command parsing) lives in `lib/uidcore` and is
+covered by Unity tests in `test/test_uidcore`. They run on the PC, no board
+required:
+
+```bash
+pio test -e native
+```
+
+The same tests can run on the Uno itself (`pio test -e uno` with the board
+connected). Everything that talks to the RC522 (`doRead`, `doWrite`,
+`doDiagnose`) is not unit-tested; check it on real hardware.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the native tests and builds
+the Uno firmware on every push to `master` and on pull requests. The built
+`firmware.hex` is attached to each run as an artifact.
 
 ## How to use
 
